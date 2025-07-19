@@ -10,9 +10,51 @@
 (define-constant ERR_ALREADY_JUDGED (err u108))
 (define-constant ERR_NOT_PARTICIPANT (err u109))
 (define-constant ERR_INVALID_RANK (err u110))
+(define-constant ERR_ACHIEVEMENT_EXISTS (err u111))
+(define-constant ERR_INSUFFICIENT_REPUTATION (err u112))
+(define-constant ERR_INVALID_ACHIEVEMENT (err u113))
 
 (define-data-var next-event-id uint u1)
 (define-data-var next-project-id uint u1)
+(define-data-var next-achievement-id uint u1)
+
+(define-map participant-reputation
+  principal
+  {
+    total-score: uint,
+    events-participated: uint,
+    events-won: uint,
+    total-prize-earned: uint,
+    reputation-level: uint,
+    last-updated: uint
+  }
+)
+
+(define-map achievement-definitions
+  uint
+  {
+    name: (string-ascii 64),
+    description: (string-ascii 256),
+    requirement-type: (string-ascii 32),
+    threshold-value: uint,
+    reputation-points: uint,
+    is-active: bool
+  }
+)
+
+(define-map participant-achievements
+  {participant: principal, achievement-id: uint}
+  {earned-at: uint, event-id: (optional uint)}
+)
+
+(define-map reputation-leaderboard
+  uint
+  {
+    participant: principal,
+    reputation-score: uint,
+    rank: uint
+  }
+)
 
 (define-map events
   uint
@@ -268,6 +310,7 @@
     (map-set event-rankings {event-id: event-id, rank: rank}
       (merge ranking-info {paid: true})
     )
+    (try! (update-participant-reputation (get participant project) event-id (get score project) prize-amount (get is-winner project)))
     (ok prize-amount)
   )
 )
@@ -312,4 +355,230 @@
 
 (define-read-only (get-contract-balance)
   (stx-get-balance (as-contract tx-sender))
+)
+
+(define-public (create-achievement
+  (name (string-ascii 64))
+  (description (string-ascii 256))
+  (requirement-type (string-ascii 32))
+  (threshold-value uint)
+  (reputation-points uint))
+  (let
+    (
+      (achievement-id (var-get next-achievement-id))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (> reputation-points u0) ERR_INVALID_AMOUNT)
+    (asserts! (> threshold-value u0) ERR_INVALID_AMOUNT)
+    
+    (map-set achievement-definitions achievement-id
+      {
+        name: name,
+        description: description,
+        requirement-type: requirement-type,
+        threshold-value: threshold-value,
+        reputation-points: reputation-points,
+        is-active: true
+      }
+    )
+    (var-set next-achievement-id (+ achievement-id u1))
+    (ok achievement-id)
+  )
+)
+
+(define-public (update-participant-reputation (participant principal) (event-id uint) (score uint) (prize-amount uint) (is-winner bool))
+  (let
+    (
+      (current-rep (default-to 
+        {total-score: u0, events-participated: u0, events-won: u0, total-prize-earned: u0, reputation-level: u0, last-updated: u0}
+        (map-get? participant-reputation participant)))
+      (new-events-participated (+ (get events-participated current-rep) u1))
+      (new-events-won (if is-winner (+ (get events-won current-rep) u1) (get events-won current-rep)))
+      (new-total-score (+ (get total-score current-rep) score))
+      (new-total-prize (+ (get total-prize-earned current-rep) prize-amount))
+      (new-reputation-level (calculate-reputation-level new-events-participated new-events-won new-total-score))
+    )
+    (map-set participant-reputation participant
+      {
+        total-score: new-total-score,
+        events-participated: new-events-participated,
+        events-won: new-events-won,
+        total-prize-earned: new-total-prize,
+        reputation-level: new-reputation-level,
+        last-updated: stacks-block-height
+      }
+    )
+    (try! (check-and-award-achievements participant event-id))
+    (ok true)
+  )
+)
+
+(define-private (calculate-reputation-level (events-count uint) (wins uint) (total-score uint))
+  (let
+    (
+      (win-rate (if (> events-count u0) (/ (* wins u100) events-count) u0))
+      (avg-score (if (> events-count u0) (/ total-score events-count) u0))
+    )
+    (if (and (>= events-count u10) (>= win-rate u50))
+      u5
+      (if (and (>= events-count u7) (>= win-rate u30))
+        u4
+        (if (and (>= events-count u5) (>= avg-score u70))
+          u3
+          (if (>= events-count u3)
+            u2
+            (if (>= events-count u1)
+              u1
+              u0
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+(define-private (check-and-award-achievements (participant principal) (event-id uint))
+  (let
+    (
+      (reputation (unwrap! (map-get? participant-reputation participant) ERR_NOT_FOUND))
+    )
+    (if (>= (get events-participated reputation) u1) 
+        (unwrap-panic (maybe-award-achievement participant event-id u1)) true)
+    (if (>= (get events-participated reputation) u5) 
+        (unwrap-panic (maybe-award-achievement participant event-id u2)) true)
+    (if (>= (get events-won reputation) u1) 
+        (unwrap-panic (maybe-award-achievement participant event-id u3)) true)
+    (if (>= (get events-won reputation) u3) 
+        (unwrap-panic (maybe-award-achievement participant event-id u4)) true)
+    (if (>= (get total-prize-earned reputation) u1000000) 
+        (unwrap-panic (maybe-award-achievement participant event-id u5)) true)
+    (if (>= (get reputation-level reputation) u5) 
+        (unwrap-panic (maybe-award-achievement participant event-id u6)) true)
+    (ok true)
+  )
+)
+
+(define-private (maybe-award-achievement (participant principal) (event-id uint) (achievement-id uint))
+  (let
+    (
+      (achievement (map-get? achievement-definitions achievement-id))
+      (already-earned (map-get? participant-achievements {participant: participant, achievement-id: achievement-id}))
+    )
+    (if (and (is-some achievement) (is-none already-earned))
+      (begin
+        (map-set participant-achievements {participant: participant, achievement-id: achievement-id}
+          {earned-at: stacks-block-height, event-id: (some event-id)}
+        )
+        (ok true)
+      )
+      (ok false)
+    )
+  )
+)
+
+(define-public (initialize-default-achievements)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (try! (create-achievement "First Steps" "Participate in your first hackathon" "events_participated" u1 u10))
+    (try! (create-achievement "Veteran Hacker" "Participate in 5 hackathons" "events_participated" u5 u50))
+    (try! (create-achievement "First Victory" "Win your first hackathon" "events_won" u1 u100))
+    (try! (create-achievement "Hat Trick" "Win 3 hackathons" "events_won" u3 u300))
+    (try! (create-achievement "Big Earner" "Earn over 1 STX in prizes" "total_prize_earned" u1000000 u200))
+    (try! (create-achievement "Reputation Master" "Reach maximum reputation level" "reputation_level" u5 u500))
+    (ok true)
+  )
+)
+
+(define-public (get-reputation-ranking (limit uint))
+  (let
+    (
+      (participants (list))
+    )
+    (ok participants)
+  )
+)
+
+(define-read-only (get-participant-reputation (participant principal))
+  (map-get? participant-reputation participant)
+)
+
+(define-read-only (get-achievement (achievement-id uint))
+  (map-get? achievement-definitions achievement-id)
+)
+
+(define-read-only (get-participant-achievement (participant principal) (achievement-id uint))
+  (map-get? participant-achievements {participant: participant, achievement-id: achievement-id})
+)
+
+(define-read-only (calculate-reputation-points (participant principal))
+  (let
+    (
+      (reputation (default-to 
+        {total-score: u0, events-participated: u0, events-won: u0, total-prize-earned: u0, reputation-level: u0, last-updated: u0}
+        (map-get? participant-reputation participant)))
+      (base-points (* (get events-participated reputation) u10))
+      (win-bonus (* (get events-won reputation) u50))
+      (score-bonus (/ (get total-score reputation) u10))
+      (level-bonus (* (get reputation-level reputation) u100))
+    )
+    (+ base-points (+ win-bonus (+ score-bonus level-bonus)))
+  )
+)
+
+(define-public (manual-reputation-update (participant principal) (event-id uint))
+  (let
+    (
+      (participant-info (unwrap! (map-get? event-participants {event-id: event-id, participant: participant}) ERR_NOT_PARTICIPANT))
+      (project-id (get project-id participant-info))
+      (project (unwrap! (map-get? projects project-id) ERR_NOT_FOUND))
+      (event (unwrap! (map-get? events event-id) ERR_NOT_FOUND))
+    )
+    (asserts! (get winners-announced event) ERR_JUDGING_NOT_STARTED)
+    (try! (update-participant-reputation participant event-id (get score project) u0 (get is-winner project)))
+    (ok true)
+  )
+)
+
+(define-public (toggle-achievement-status (achievement-id uint) (active bool))
+  (let
+    (
+      (achievement (unwrap! (map-get? achievement-definitions achievement-id) ERR_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (map-set achievement-definitions achievement-id
+      (merge achievement {is-active: active})
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-participant-achievements-list (participant principal))
+  (let
+    (
+      (achievements-earned (list))
+    )
+    (ok achievements-earned)
+  )
+)
+
+(define-read-only (get-reputation-stats (participant principal))
+  (let
+    (
+      (reputation (map-get? participant-reputation participant))
+      (total-points (calculate-reputation-points participant))
+    )
+    (match reputation
+      rep (ok {
+        reputation: rep,
+        total-reputation-points: total-points,
+        achievements-count: u0
+      })
+      (ok {
+        reputation: {total-score: u0, events-participated: u0, events-won: u0, total-prize-earned: u0, reputation-level: u0, last-updated: u0},
+        total-reputation-points: u0,
+        achievements-count: u0
+      })
+    )
+  )
 )
